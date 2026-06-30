@@ -1,0 +1,327 @@
+name: NuGet Publish
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+  DOTNET_NOLOGO: true
+  NuGetDirectory: ${{ github.workspace }}/nuget
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'changeset-release/main' &&
+      github.repository == 'monocloud/backend-dotnet'
+    permissions:
+      contents: write
+    outputs:
+      was_published: ${{ steps.version_bumped.outputs.bumped }}
+      version: ${{ steps.semver.outputs.version }}
+      prerelease: ${{ steps.semver.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install PNPM
+        uses: pnpm/action-setup@v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Dependencies
+        run: pnpm install
+
+      - name: Create Release PR or Tag
+        id: changesets
+        uses: changesets/action@v1
+        with:
+          version: ./.github/scripts/update-version.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect version bump
+        id: version_bumped
+        run: |
+          CURRENT_VERSION=$(jq -r .version package.json)
+          PREVIOUS_VERSION=$(git show HEAD^:package.json | jq -r .version)
+
+          echo "Current version:  $CURRENT_VERSION"
+          echo "Previous version: $PREVIOUS_VERSION"
+
+          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+            echo "version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract version
+        if: steps.version_bumped.outputs.bumped == 'true'
+        uses: apexskier/github-semver-parse@v1
+        id: semver
+        with:
+          version: ${{ steps.version_bumped.outputs.version }}
+
+  pack:
+    name: Pack SDK
+    needs: [release]
+    if: needs.release.outputs.was_published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.x.x
+
+      - name: Pack SDK
+        run: |
+          dotnet pack --configuration Release --output ${{ env.NuGetDirectory }} /p:ContinuousIntegrationBuild=true
+
+      - name: Upload NuGet Packages Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget
+          if-no-files-found: error
+          retention-days: 7
+          path: ${{ env.NuGetDirectory }}/*.nupkg
+
+  validate_nuget:
+    name: Validate NuGet Packages
+    needs: [release, pack]
+    if: needs.release.outputs.was_published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.x.x
+
+      - name: Download NuGet Packages Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget
+          path: ${{ env.NuGetDirectory }}
+
+      - name: Install nuget validator
+        run: dotnet tool update Meziantou.Framework.NuGetPackageValidation.Tool --global
+
+      - name: Validate package
+        run: meziantou.validate-nuget-package (Get-ChildItem "${{ env.NuGetDirectory }}/*.nupkg")
+
+  publish_release:
+    name: Publish Release to NuGet & Create GitHub Release
+    needs: [release, validate_nuget]
+    if: needs.release.outputs.was_published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download NuGet Packages Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget
+          path: ${{ env.NuGetDirectory }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.x.x
+
+      - name: NuGet login (OIDC -> short-lived API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Publish NuGet packages
+        run: |
+          dotnet nuget push "${{ env.NuGetDirectory }}/*.nupkg" \
+              --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+              --source "https://api.nuget.org/v3/index.json" \
+              --skip-duplicate
+
+      - name: Extract Changelog for Specific Version
+        id: extract_changelog
+        env:
+          TARGET_VERSION: ${{ needs.release.outputs.version }}
+          CHANGELOG_FILE: 'CHANGELOG.md'
+        run: |
+          LOG_CONTENT=$(sed -n "/^## $TARGET_VERSION\$/,/^## /{/^## $TARGET_VERSION\$/d; /^## /d; p;}" "$CHANGELOG_FILE")
+          CLEAN_LOG_CONTENT=$(echo "$LOG_CONTENT" | sed 's/^[ \t]*//;s/[ \t]*$//' | sed '/^$/d')
+          {
+            echo "changelog_content<<EOF"
+            echo "$CLEAN_LOG_CONTENT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ needs.release.outputs.version }}
+          prerelease: ${{ !!needs.release.outputs.prerelease }}
+          name: v${{ needs.release.outputs.version }}
+          artifacts: ${{ env.NuGetDirectory }}/*.nupkg
+          body: ${{ steps.extract_changelog.outputs.changelog_content }}
+
+  snapshot:
+    name: Create Snapshot Release
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '!snapshot') &&
+      github.repository == 'monocloud/backend-dotnet'
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    steps:
+      - name: Limit to users with write access
+        uses: actions/github-script@v8
+        with:
+          script: |
+            try {
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: context.actor,
+              });
+              if (!['admin', 'write', 'maintain'].includes(data.permission)) {
+                core.setFailed(`@${context.actor} lacks write access to this repository`);
+              }
+            } catch (e) {
+              core.setFailed(`@${context.actor} lacks write access to this repository`);
+            }
+
+      - name: Get PR Info
+        uses: actions/github-script@v8
+        id: pr_info
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            const headRepo = pr.head.repo ? pr.head.repo.full_name : null;
+            const baseRepo = `${context.repo.owner}/${context.repo.repo}`;
+            if (headRepo !== baseRepo) {
+              core.setFailed(
+                `Snapshot releases are only supported for branches in ${baseRepo}, ` +
+                  `not forks (PR head repo: ${headRepo}). Refusing to build and publish untrusted code.`
+              );
+              return;
+            }
+            core.setOutput('head_sha', pr.head.sha);
+
+      - name: Checkout Repo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.pr_info.outputs.head_sha }}
+          fetch-depth: 0
+
+      - name: Install PNPM
+        uses: pnpm/action-setup@v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Dependencies
+        run: pnpm install
+
+      - name: Force Patch Snapshot Changeset
+        run: |
+          echo "Clearing existing changesets to force patch snapshot..."
+          find .changeset -name "*.md" ! -name "README.md" -delete
+
+          echo "Creating temporary patch changeset."
+
+          cat <<EOF > .changeset/temp-snapshot.md
+          ---
+          '@monocloud/backend-dotnet': patch
+          ---
+
+          Snapshot release.
+          EOF
+
+      - name: Create Snapshot Version
+        run: pnpm changeset version --snapshot canary
+
+      - name: Resolve snapshot version
+        id: version
+        run: echo "version=$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.x.x
+
+      - name: Pack
+        run: |
+          PACKAGE_VERSION=$(jq -r .version package.json)
+          echo "Packing snapshot version: $PACKAGE_VERSION"
+          dotnet pack --configuration Release --output ${{ env.NuGetDirectory }} /p:Version="$PACKAGE_VERSION"
+
+      - name: NuGet login (OIDC -> short-lived API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Push snapshot to NuGet
+        run: |
+          dotnet nuget push "${{ env.NuGetDirectory }}/*.nupkg" \
+              --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+              --source "https://api.nuget.org/v3/index.json" \
+              --skip-duplicate
+
+      - name: Comment on PR with version
+        uses: actions/github-script@v8
+        env:
+          SNAPSHOT_VERSION: ${{ steps.version.outputs.version }}
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🚀 Snapshot published to NuGet!\nVersion: \`${process.env.SNAPSHOT_VERSION}\``
+            })
