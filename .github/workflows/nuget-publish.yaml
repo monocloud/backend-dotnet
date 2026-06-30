@@ -267,20 +267,14 @@ jobs:
       - name: Install Dependencies
         run: pnpm install
 
-      - name: Force Patch Snapshot Changeset
+      - name: Ensure Snapshot Changeset
         run: |
-          echo "Clearing existing changesets to force patch snapshot..."
-          find .changeset -name "*.md" ! -name "README.md" -delete
-
-          echo "Creating temporary patch changeset."
-
-          cat <<EOF > .changeset/temp-snapshot.md
-          ---
-          '@monocloud/backend-dotnet': patch
-          ---
-
-          Snapshot release.
-          EOF
+          if [ -z "$(find .changeset -name '*.md' ! -name 'README.md' -print -quit)" ]; then
+            echo "No pending changesets; creating a temporary patch changeset."
+            printf '%s\n' "---" "'@monocloud/backend-dotnet': patch" "---" "" "Snapshot release." > .changeset/temp-snapshot.md
+          else
+            echo "Using existing changesets to compute the snapshot version."
+          fi
 
       - name: Create Snapshot Version
         run: pnpm changeset version --snapshot canary
