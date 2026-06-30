@@ -36,7 +36,7 @@ jobs:
         run: dotnet build --no-restore --nologo --configuration Release
 
       - name: Cache Build
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .
           key: build-${{ github.run_id }}-${{ github.run_attempt }}
@@ -76,7 +76,7 @@ jobs:
           dotnet-version: 10.x.x
 
       - name: Load Cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .
           key: build-${{ github.run_id }}-${{ github.run_attempt }}
